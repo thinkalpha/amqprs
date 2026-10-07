@@ -30,7 +30,7 @@ use std::{
 use amqp_serde::types::AmqpChannelId;
 use tokio::sync::{
     mpsc::{self, error::SendError},
-    oneshot,
+    oneshot, Mutex,
 };
 
 use super::callbacks::ChannelCallback;
@@ -163,6 +163,10 @@ pub(crate) struct SharedChannelInner {
 /// A closed channel's ID is released and may be reused by a newly opened
 /// channel, so a retained handle must not send frames under that ID.
 pub(crate) struct ChannelOutgoingTx {
+    // Admission stays locked until enqueue finishes. Closing takes the same
+    // lock before changing state, so every admitted frame precedes CloseOk
+    // in the writer queue and therefore precedes any reuse of the ID.
+    admission: Mutex<()>,
     is_open: Arc<AtomicBool>,
     tx: mpsc::Sender<OutgoingMessage>,
 }
@@ -172,6 +176,7 @@ impl ChannelOutgoingTx {
         &self,
         message: OutgoingMessage,
     ) -> std::result::Result<(), SendError<OutgoingMessage>> {
+        let _admission = self.admission.lock().await;
         if !self.is_open.load(Ordering::Relaxed) {
             return Err(SendError(message));
         }
@@ -182,10 +187,16 @@ impl ChannelOutgoingTx {
         &self,
         message: OutgoingMessage,
     ) -> std::result::Result<(), SendError<OutgoingMessage>> {
+        let _admission = self.admission.blocking_lock();
         if !self.is_open.load(Ordering::Relaxed) {
             return Err(SendError(message));
         }
         self.tx.blocking_send(message)
+    }
+
+    async fn mark_closed(&self) -> bool {
+        let _admission = self.admission.lock().await;
+        self.is_open.swap(false, Ordering::AcqRel)
     }
 
     /// Sends regardless of open state, for close handshake frames and replies
@@ -319,7 +330,8 @@ impl Channel {
     pub fn is_open(&self) -> bool {
         self.shared.is_open.load(Ordering::Relaxed)
     }
-    pub(crate) fn set_is_open(&self, is_open: bool) {
+    pub(crate) async fn set_is_open(&self, is_open: bool) {
+        let _admission = self.shared.outgoing_tx.admission.lock().await;
         self.shared.is_open.store(is_open, Ordering::Relaxed);
     }
 
@@ -361,12 +373,7 @@ impl Channel {
         // if connection closed, no need to close channel
         if self.is_connection_open() {
             // check if channel is open
-            if let Ok(true) = self.shared.is_open.compare_exchange(
-                true,
-                false,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
+            if self.shared.outgoing_tx.mark_closed().await {
                 #[cfg(feature = "traces")]
                 info!("close channel {}", self);
                 self.shared.close_handshake().await?;
@@ -393,16 +400,15 @@ impl Drop for DropGuard {
     ///
     /// [`close`]: struct.Channel.html#method.close
     fn drop(&mut self) {
-        if let Ok(true) =
-            self.0
-                .is_open
-                .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-        {
+        if self.0.is_open.load(Ordering::Relaxed) {
             #[cfg(feature = "traces")]
             trace!("drop channel {}", self.0.channel_id);
 
             let inner = self.0.clone();
             tokio::spawn(async move {
+                if !inner.outgoing_tx.mark_closed().await {
+                    return;
+                }
                 #[cfg(feature = "traces")]
                 info!("try to close channel {} at drop", inner.channel_id);
                 if let Err(err) = inner.close_handshake().await {
@@ -445,6 +451,7 @@ impl SharedChannelInner {
         let is_open = Arc::new(is_open);
         Self {
             outgoing_tx: ChannelOutgoingTx {
+                admission: Mutex::new(()),
                 is_open: is_open.clone(),
                 tx: outgoing_tx,
             },
@@ -453,6 +460,96 @@ impl SharedChannelInner {
             conn_mgmt_tx,
             dispatcher_mgmt_tx,
         }
+    }
+}
+
+#[cfg(test)]
+mod send_admission_tests {
+    use super::*;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    fn sender() -> (Arc<ChannelOutgoingTx>, mpsc::Receiver<OutgoingMessage>) {
+        let (tx, rx) = mpsc::channel(1);
+        (
+            Arc::new(ChannelOutgoingTx {
+                admission: Mutex::new(()),
+                is_open: Arc::new(AtomicBool::new(true)),
+                tx,
+            }),
+            rx,
+        )
+    }
+
+    fn frame() -> OutgoingMessage {
+        (1, Flow::new(true).into_frame())
+    }
+
+    #[tokio::test]
+    async fn async_send_cannot_be_overtaken_by_close() {
+        let (sender, mut rx) = sender();
+        sender.unchecked().send(frame()).await.unwrap();
+        let send = sender.send(frame());
+        tokio::pin!(send);
+        assert!(poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx).is_pending())).await);
+
+        // The send has checked open state and is waiting for queue capacity.
+        // Closure must wait for that admission to finish before acknowledging
+        // the close and allowing the connection to recycle this channel ID.
+        let close = sender.mark_closed();
+        tokio::pin!(close);
+        assert!(poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx).is_pending())).await);
+        assert!(sender.is_open.load(Ordering::Relaxed));
+
+        rx.recv().await.unwrap();
+        send.await.unwrap();
+        assert!(close.await);
+        rx.recv().await.unwrap();
+        assert!(sender.send(frame()).await.is_err());
+        assert!(rx.try_recv().is_err());
+
+        // The protocol acknowledgement can still be enqueued after closure.
+        sender
+            .unchecked()
+            .send((1, CloseChannelOk.into_frame()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap().1,
+            Frame::CloseChannelOk(_, _)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_send_cannot_be_overtaken_by_close() {
+        let (sender, mut rx) = sender();
+        sender.unchecked().send(frame()).await.unwrap();
+        let blocking_sender = sender.clone();
+        let send = tokio::task::spawn_blocking(move || blocking_sender.blocking_send(frame()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sender.admission.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking send must acquire admission");
+
+        let close = sender.mark_closed();
+        tokio::pin!(close);
+        assert!(poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx).is_pending())).await);
+        rx.recv().await.unwrap();
+        send.await.unwrap().unwrap();
+        assert!(close.await);
+        rx.recv().await.unwrap();
+
+        let blocking_sender = sender.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || blocking_sender.blocking_send(frame()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
 

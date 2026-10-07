@@ -306,7 +306,7 @@ impl ChannelDispatcher {
                             // frames for closing channel
                             // channel.close-ok response from server
                             Frame::CloseChannelOk(method_header, close_channel_ok) => {
-                                self.channel.set_is_open(false);
+                                self.channel.set_is_open(false).await;
 
                                 match self.responders.remove(method_header) {
                                     Some(responder) => responder.send(close_channel_ok.into_frame()).unwrap(),
@@ -330,7 +330,7 @@ impl ChannelDispatcher {
                                     #[cfg(feature="traces")]
                                     error!("callback not registered on channel {}", self.channel);
                                 }
-                                self.channel.set_is_open(false);
+                                self.channel.set_is_open(false).await;
 
                                 // implictly respond OK to server
                                 self.channel.shared.outgoing_tx.unchecked()
@@ -585,7 +585,7 @@ impl ChannelDispatcher {
                     }
                 }
             }
-            self.channel.set_is_open(false);
+            self.channel.set_is_open(false).await;
 
             #[cfg(feature = "traces")]
             info!("exit dispatcher of channel {}", self.channel);
