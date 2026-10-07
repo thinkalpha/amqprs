@@ -28,7 +28,10 @@ use std::{
 };
 
 use amqp_serde::types::AmqpChannelId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{
+    mpsc::{self, error::SendError},
+    oneshot,
+};
 
 use super::callbacks::ChannelCallback;
 use crate::{
@@ -143,15 +146,53 @@ struct DropGuard(Arc<SharedChannelInner>);
 
 pub(crate) struct SharedChannelInner {
     /// open state
-    is_open: AtomicBool,
+    is_open: Arc<AtomicBool>,
     /// channel id
     channel_id: AmqpChannelId,
     /// tx half to send message to `WriteHandler` task
-    outgoing_tx: mpsc::Sender<OutgoingMessage>,
+    outgoing_tx: ChannelOutgoingTx,
     /// tx half to send managment command to `ReaderHandler` task
     conn_mgmt_tx: mpsc::Sender<ConnManagementCommand>,
     /// tx half to send management command to `ChannelDispatcher` task
     dispatcher_mgmt_tx: mpsc::UnboundedSender<DispatcherManagementCommand>,
+}
+
+/// Sender of a channel's outgoing frames that rejects frames once the channel
+/// is closed.
+///
+/// A closed channel's ID is released and may be reused by a newly opened
+/// channel, so a retained handle must not send frames under that ID.
+pub(crate) struct ChannelOutgoingTx {
+    is_open: Arc<AtomicBool>,
+    tx: mpsc::Sender<OutgoingMessage>,
+}
+
+impl ChannelOutgoingTx {
+    pub(crate) async fn send(
+        &self,
+        message: OutgoingMessage,
+    ) -> std::result::Result<(), SendError<OutgoingMessage>> {
+        if !self.is_open.load(Ordering::Relaxed) {
+            return Err(SendError(message));
+        }
+        self.tx.send(message).await
+    }
+
+    pub(crate) fn blocking_send(
+        &self,
+        message: OutgoingMessage,
+    ) -> std::result::Result<(), SendError<OutgoingMessage>> {
+        if !self.is_open.load(Ordering::Relaxed) {
+            return Err(SendError(message));
+        }
+        self.tx.blocking_send(message)
+    }
+
+    /// Sends regardless of open state, for close handshake frames and replies
+    /// to the server while the channel ID is still registered.
+    pub(crate) fn unchecked(&self) -> &mpsc::Sender<OutgoingMessage> {
+        &self.tx
+    }
 }
 
 impl SharedChannelInner {
@@ -177,7 +218,7 @@ impl SharedChannelInner {
     async fn close_handshake(&self) -> Result<()> {
         let responder_rx = self.register_responder(CloseChannelOk::header()).await?;
         synchronous_request!(
-            self.outgoing_tx,
+            self.outgoing_tx.unchecked(),
             (self.channel_id, CloseChannel::default().into_frame()),
             responder_rx,
             Frame::CloseChannelOk,
@@ -401,10 +442,14 @@ impl SharedChannelInner {
         conn_mgmt_tx: mpsc::Sender<ConnManagementCommand>,
         dispatcher_mgmt_tx: mpsc::UnboundedSender<DispatcherManagementCommand>,
     ) -> Self {
+        let is_open = Arc::new(is_open);
         Self {
+            outgoing_tx: ChannelOutgoingTx {
+                is_open: is_open.clone(),
+                tx: outgoing_tx,
+            },
             is_open,
             channel_id,
-            outgoing_tx,
             conn_mgmt_tx,
             dispatcher_mgmt_tx,
         }
